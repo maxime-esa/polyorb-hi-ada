@@ -40,6 +40,7 @@ with GNAT.Sockets;
 
 with PolyORB_HI.Messages;
 with PolyORB_HI.Output;
+with system.io;
 
 with PolyORB_HI_Generated.Transport;
 
@@ -122,9 +123,7 @@ package body PolyORB_HI_Drivers_Client_BLE is
             IP_Protocol_For_TCP_Level,
             (No_Delay, True));
 
-      Bind_Socket
-           (Socket_Receive,
-            Address_Receive);
+      Bind_Socket (Socket_Receive, Address_Receive);
       Listen_Socket (Socket_Receive);
 
       --  pragma Debug (Verbose,
@@ -163,6 +162,7 @@ package body PolyORB_HI_Drivers_Client_BLE is
       Initialize_Receiver;
       --  pragma Debug (Verbose, Put_Line ("Initialization of socket subsystem"
       --                          & " is complete"));
+      --  pragma Debug (Verbose, Put_Line ("Driver initialized"));
    exception
       when E : others =>
          --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
@@ -181,6 +181,8 @@ package body PolyORB_HI_Drivers_Client_BLE is
    procedure Initialize_Receiver is
       Socket    : Socket_Type;
       Address   : Sock_Addr_Type;
+
+      --  Channel : Stream_Access := Stream (Socket_Send);
    begin
       --  Wait for the connection of python socket
 
@@ -188,9 +190,9 @@ package body PolyORB_HI_Drivers_Client_BLE is
       --                   ("Waiting on "
       --                    & Image (Nodes (My_Node).Address)));
 
-      Address := No_Sock_Addr;
-      Socket  := No_Socket;
       Accept_Socket (Socket_Receive, Socket, Address);
+      Socket_Receive := Socket;
+      --  String'Write (Channel, "Client accepted");
 
    end Initialize_Receiver;
 
@@ -204,48 +206,58 @@ package body PolyORB_HI_Drivers_Client_BLE is
       SEL       : AS_Message_Length_Stream;
       SEA       : AS_Full_Stream;
       SEO       : AS.Stream_Element_Offset;
+
    begin
 
       Main_Loop :
       loop
-
-         --  Put_Line ("Using user-provided TCP/IP stack to receive");
-         --  pragma Debug (Verbose, Put_Line ("Check mailboxes"));
-
          --  Receive message length
 
          Receive_Socket (Socket_Receive, SEL, SEO);
 
          --  Receive zero bytes means that peer is dead
-
          if SEO = 0 then
-            --  pragma Debug (Verbose, Put_Line
-            --                 ("Node " & Node_Type'Image (N)
-            --                  & " is dead"));
+            --  pragma Debug (Verbose, Put_Line ("Closing Socket_Receive"));
+            System.IO.Put_Line ("Closing socket"); 
+            Close_Socket (Socket_Receive);
             exit Main_Loop;
+            
+         elsif SEO = SEL'First - 1 then
+            System.IO.Put_Line ("Dropped message");
+            goto End_Of_Loop;
          end if;
 
          SEO := AS.Stream_Element_Offset
                  (To_Length (To_PO_HI_Message_Length_Stream (SEL)));
          --  pragma Debug (Verbose, Put_Line
          --                ("received"
-         --                 & AS.Stream_Element_Offset'Image (SEO)
-         --                 & " bytes from node " & Node_Type'Image (N)));
+         --                   & AS.Stream_Element_Offset'Image (SEO)
+         --                   & " bytes"));
 
          --  Get the message and preserve message length to keep
          --  compatible with a local message delivery.
 
          SEA (1 .. Message_Length_Size) := SEL;
          Receive_Socket (Socket_Receive,
-                               SEA (Message_Length_Size + 1 .. SEO + 1), SEO);
+                         SEA (Message_Length_Size + 1 .. SEO + 1),
+                         SEO);
 
+         if SEO = Message_Length_Size then
+            System.IO.Put_Line ("Dropped message");
+            goto End_Of_Loop;
+         end if;
+         
          --  Deliver to the peer handler
-
+         --  pragma Debug (Verbose, Put_Line ("Delivering message"));
+         System.IO.Put_Line ("Delivering message");
          PolyORB_HI_Generated.Transport.Deliver
                  (Corresponding_Entity
-                  (Unsigned_8 (SEA (Message_Length_Size + 1))),
+                    (Unsigned_8 (SEA (Message_Length_Size + 1))),
                   To_PO_HI_Full_Stream (SEA)
-                    (1 .. Stream_Element_Offset (SEO)));
+                  (1 .. Stream_Element_Offset (SEO)));
+
+         --  pragma Debug (Verbose, Put_Line ("Delivered"));
+         <<End_Of_Loop>>
       end loop Main_Loop;
 
    exception
@@ -256,7 +268,10 @@ package body PolyORB_HI_Drivers_Client_BLE is
          --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
          --                ("Message "
          --                 & Ada.Exceptions.Exception_Message (E)));
-      null;
+      System.IO.Put_Line ("Exception "
+                          & Ada.Exceptions.Exception_Name (E));
+      System.IO.Put_Line ("Message  "
+                          & Ada.Exceptions.Exception_Message (E));
    end Receive;
 
    ----------
