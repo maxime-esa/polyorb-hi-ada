@@ -34,6 +34,7 @@ pragma Style_Checks (off);
 with Types;               use Types;
 
 with Crazyflie_System;    use Crazyflie_System;
+with Crazyflie_Config;    use Crazyflie_Config;
 with Radiolink;           use Radiolink;
 with CRTP;                use CRTP;
 with Syslink;             use Syslink;
@@ -55,6 +56,8 @@ with PolyORB_HI_Generated.Transport;
 
 with System; use System;
 
+with POHICDRIVER_BLUETOOTH;
+
 
 package body PolyORB_HI_Drivers_Crazyflie_BLE is
 
@@ -71,6 +74,18 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
    use PolyORB_HI.Utils;
    use PolyORB_HI.Output;
 
+   use POHICDRIVER_BLUETOOTH;
+
+   type Bluetooth_Conf_T_Acc is access all POHICDRIVER_Bluetooth.Bluetooth_Conf_T;
+   function To_Bluetooth_Conf_T_Acc is new Ada.Unchecked_Conversion
+     (System.Address, Bluetooth_Conf_T_Acc);
+
+   type Node_Record is record
+      Bluetooth_Config : Bluetooth_Conf_T;
+   end record;
+
+   Nodes : array (Node_Type) of Node_Record;
+
    subtype AS_Message_Length_Stream is AS.Stream_Element_Array
      (1 .. Message_Length_Size);
    subtype Message_Length_Stream is Stream_Element_Array
@@ -85,21 +100,139 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
      (AS_Full_Stream, Full_Stream);
 
    Connected_To_Radio : Boolean := False;
-   Dropped_Packets    : Integer := 0;
+   Dropped_Packets    : T_Uint8 := 0;
+   Enqueued_Packets   : T_Uint8 := 0;
 
    ----------------
    -- Initialize --
    ----------------
 
    procedure Initialize (Name_Table : PolyORB_HI.Utils.Naming_Table_Type) is
+      --  Use_ASN1 : Boolean := False;
+      My_Channel  : T_Uint8;
+      My_Datarate : T_Uint8;
+      My_Address  : T_Uint64;
 
+      function Address_To_Uint64 is new Ada.Unchecked_Conversion
+        (Address_T_array, T_Uint64);
    begin
       Initialize_EXT_UART;
       System_Init;
       Connected_To_Radio := False;
       if System_Self_Test then
-         Send_To_UART("[BLE] initialized");
+         null; --  Send_To_UART("[BLE] initialized");
       end if;
+
+      -------------------------------
+      -- Getting the configuration --
+      -------------------------------
+      for J in Name_Table'Range loop
+         if Name_Table (J).Variable = System.Null_Address then
+            --  The structure of the location information is
+            --     "bluetooth CHANNEL DATARATE ADDRESS"
+
+            declare
+               S : constant String := PolyORB_HI.Utils.To_String
+                                          (Name_Table (J).Location);
+               Channel  : T_Uint8;
+               Datarate : T_Uint8;
+               Address  : Address_T;
+
+               First, Last, i : Integer;
+
+            begin
+               First := S'First;
+
+               --  First parse the prefix "bluetooth"
+
+               Last := Parse_String (S, First, ' ');
+
+               if S (First .. Last) /= "bluetooth" then
+                  raise Program_Error with "Invalid configuration";
+               end if;
+               
+               --  Then, parse the channel
+
+               First := Last + 2;
+               Last := Parse_String (S, First, ' ');
+
+               begin
+                  Channel := T_Uint8'Value (S (First .. Last));
+               exception
+                  when others =>
+                     raise Program_Error with "Wrong channel" & S (First .. Last);
+               end;
+               if Channel > 125 then
+                  raise Program_Error with "Wrong channel" & S (First .. Last);
+               end if;
+
+               --  Then, parse the data rate
+
+               First := Last + 2;
+               Last := Parse_String (S, First, ' ');
+               
+               if S (First .. Last) = "250K" then
+                  Datarate :=  RADIO_RATE'Pos (RADIO_RATE_250K);
+               elsif S (First .. Last) = "1M" then
+                  Datarate :=  RADIO_RATE'Pos (RADIO_RATE_1M);
+               elsif S (First .. Last) = "2M" then
+                  Datarate :=  RADIO_RATE'Pos (RADIO_RATE_2M);    
+               else
+                  raise Program_Error with "Wrong data rate: " & S (First .. Last);
+               end if;
+
+               --  Finally, parse the address
+
+               First := Last + 2;
+               Last := Parse_String (S, First, ' ');
+
+               --  The address should be 5 bytes in hexadecimal
+               if Last - First /= 9 then
+                  raise Program_Error with "Wrong address: " & S (First .. Last);
+               end if;
+               
+               i := First;
+               while i < Last loop
+                  Address.Data (i) := Unsigned_8'Value (S (i .. i + 2));
+                  i := i + 2; 
+               end loop;    
+
+               Nodes (J).Bluetooth_Config.channel  := Bluetooth_Conf_T_channel (Channel);
+               Nodes (J).Bluetooth_Config.datarate := Datarate_T'Val (Datarate);
+               Nodes (J).Bluetooth_Config.address  := Address;
+               
+            end;
+         else
+            --  We got an ASN.1 configuration variable, use it
+            --  directly.
+            --  Use_ASN1 := True;
+            Nodes (J).Bluetooth_Config := To_Bluetooth_Conf_T_Acc
+              (Name_Table (J).Variable).all;
+
+         end if;
+      end loop;
+
+      My_Channel  := T_Uint8 (Nodes (My_Node).Bluetooth_Config.channel);
+      My_Datarate := Datarate_T'Pos (Nodes (My_Node).Bluetooth_Config.datarate);
+      My_Address  := Address_To_Uint64 (Nodes (My_Node).Bluetooth_Config.address.Data);
+
+      --  Update radio configuration if necessary
+      if My_Channel /= RADIO_CHANNEL then
+         Radiolink_Set_Channel (My_Channel);
+      end if;
+
+     if My_Datarate /= RADIO_DATARATE then
+         Radiolink_Set_Data_Rate (My_Datarate);
+     end if;
+
+     if My_Address /= RADIO_ADDRESS then
+        Radiolink_Set_Address (My_Address);
+     end if;
+
+     Send_To_UART ("[BLE] Configured " 
+                   & T_Uint8'Image (My_Channel) & " "
+                   & Datarate_T'Image (Nodes (My_Node).Bluetooth_Config.datarate) & " "
+                   & T_Uint64'Image (My_Address));
 
    end Initialize;
 
@@ -159,7 +292,6 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
          --  Wait until a CRTP Packet is received
          Radiolink_Receive_Packet_Blocking(Rx_Packet);
          --  Send_To_UART("[Receive] CRTP Packet received");
-
 
          if Rx_Packet.Port = CRTP_PORT_LINK
          then
@@ -229,7 +361,8 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
       Has_Succeed : Boolean;
       Free_Bytes_In_Packet : Boolean := True;
 
-      Size_Int : Integer := Integer (Ada.Streams.Stream_Element_Offset (Size));
+      Size_Int : constant Integer 
+        := Integer (Ada.Streams.Stream_Element_Offset (Size));
 
    begin
 
@@ -276,8 +409,12 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
          else
             --  We don't want to reset if the communication is not established
             if Has_Succeed then
-               Connected_To_Radio := True;
+               Enqueued_Packets := Enqueued_Packets + 1;
             end if;
+            --  The size of the Tx queue of Radiolink is 3
+            if Enqueued_Packets >= 4 then
+               Connected_To_Radio := True;
+            end if;    
          end if;
 
          return Error_Kind'(Error_None);
