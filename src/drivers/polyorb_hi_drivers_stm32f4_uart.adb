@@ -305,7 +305,7 @@ package body PolyORB_HI_Drivers_STM32F4_UART is
          else
             --  We got an ASN.1 configuration variable, use it
             --  directly.
-	    Use_ASN1 := True;
+            Use_ASN1 := True;
             Nodes (J).UART_Config := To_Serial_Conf_T_Acc
               (Name_Table (J).Variable).all;
 
@@ -313,10 +313,10 @@ package body PolyORB_HI_Drivers_STM32F4_UART is
       end loop;
 
       if Nodes (My_Node).UART_Config.Use_Paritybit then
-	 Parity := To_GNAT_Parity_Check
-	   (Nodes (My_Node).UART_Config.Parity);
+         Parity := To_GNAT_Parity_Check
+        (Nodes (My_Node).UART_Config.Parity);
       else
-	 Parity := No_Parity;
+         Parity := No_Parity;
       end if;
 
       -------------------------
