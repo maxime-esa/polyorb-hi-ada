@@ -29,25 +29,24 @@
 --                                                                          --
 ------------------------------------------------------------------------------
 
+with Ada.Interrupts;       use Ada.Interrupts;
+with Ada.Interrupts.Names; use Ada.Interrupts.Names;
 with Ada.Streams;
 with Ada.Exceptions;
 with Ada.Real_Time;
 with Interfaces;
 with Ada.Unchecked_Conversion;
 with System;
-
-with GNAT.Sockets;
+with System.IO;
 
 with PolyORB_HI.Messages;
 with PolyORB_HI.Output;
-with system.io;
-
 with PolyORB_HI_Generated.Transport;
 
---  with POHICDRIVER_IP;
+with Python;   use Python;
 
---  This package provides support for the TCP_IP device driver as
---  defined in the tcp_protocol.aadl AADLv2 model.
+with POHICDRIVER_BLUETOOTH;
+
 
 package body PolyORB_HI_Drivers_Client_BLE is
 
@@ -57,17 +56,34 @@ package body PolyORB_HI_Drivers_Client_BLE is
    --  We do not want a pragma Elaborate_All to be implicitely
    --  generated for Transport.
 
+   pragma Linker_Options ("-lpython3.5m");
+
    package AS renames Ada.Streams;
 
    use Ada.Real_Time;
    use Interfaces;
    use System;
-   use GNAT.Sockets;
    use PolyORB_HI.Messages;
    use PolyORB_HI.Utils;
    use PolyORB_HI.Output;
+   
+   use POHICDRIVER_BLUETOOTH;
 
---     use POHICDRIVER_IP;
+   type Bluetooth_Conf_T_Acc is access all POHICDRIVER_Bluetooth.Bluetooth_Conf_T;
+   function To_Bluetooth_Conf_T_Acc is new Ada.Unchecked_Conversion
+                                               (System.Address, Bluetooth_Conf_T_Acc);
+
+   type State_T is (NONE, CONNECTED, DISCONNECTED);
+   
+   type Node_Record is record
+      Bluetooth_Config : Bluetooth_Conf_T;
+      --  Updated with a positive value for Nodes corresponding to Crazyflies
+      --  Map nodes with indices in the python list of Cflies
+      Cf_ID : Integer := -1;
+      State : State_T := NONE;
+   end record;
+
+   Nodes : array (Node_Type) of Node_Record;
 
    subtype AS_One_Element_Stream is AS.Stream_Element_Array (1 .. 1);
    subtype AS_Message_Length_Stream is AS.Stream_Element_Array
@@ -81,10 +97,26 @@ package body PolyORB_HI_Drivers_Client_BLE is
      (AS_Message_Length_Stream, Message_Length_Stream);
    function To_PO_HI_Full_Stream is new Ada.Unchecked_Conversion
      (AS_Full_Stream, Full_Stream);
-
-   --  Sockets
-   Socket_Receive : Socket_Type;
-   Socket_Send    : Socket_Type;
+   
+   
+   Crazyradio_ID : constant Natural := 0;
+   --  Configuration : 1 PC and N drones => N + 1 Nodes
+   --  Node_Type enumerates all the nodes so 'Pos goes from 0 to N
+   NB_DRONES : constant Natural := Node_Type'Pos (Node_Type'Last);
+   Dead_Links : Natural := 0;
+   
+   
+   -----------------------------------
+   --  Get_URI_From_Bluetooth_Conf  --
+   -----------------------------------
+   function Get_URI_From_Bluetooth_Conf (BLE_Conf : Bluetooth_Conf_T) return URI is
+      Node_URI : URI;
+   begin
+      Node_URI.Radio_ID := Crazyradio_ID;
+      Node_URI.Channel  := Natural (BLE_Conf.channel);
+      Node_URI.Datarate := BLE_Conf.datarate;
+      return Node_URI;
+   end Get_URI_From_Bluetooth_Conf;
 
 
    ----------------
@@ -92,109 +124,133 @@ package body PolyORB_HI_Drivers_Client_BLE is
    ----------------
 
    procedure Initialize (Name_Table : PolyORB_HI.Utils.Naming_Table_Type) is
-      SEC       : AS_One_Element_Stream;
-      SEO       : AS.Stream_Element_Offset;
-      Next_Time : Time;
-      Address_Receive : Sock_Addr_Type;
-      Address_Send    : Sock_Addr_Type;
+      URIs : URIs_List (1 .. Name_Table'Length - 1);
+      Node_URI : URI;
+      Idx  : Integer := 1;
+
    begin
-      pragma Warnings (Off);
-      GNAT.Sockets.Initialize;
-      --  XXX shutdown warning on this now obscoleted function
-      pragma Warnings (On);
+      
+      Node_URI.Radio_ID := Crazyradio_ID;
+      
+      -------------------------------
+      -- Getting the configuration --
+      -------------------------------
+      for J in Name_Table'Range loop
+         if Name_Table (J).Variable = System.Null_Address then
+            --  The structure of the location information is
+            --     "bluetooth CHANNEL DATARATE ADDRESS"
 
-      --  Create the server to receive CRTP packets
-      Address_Receive.Addr := Inet_Addr("127.0.0.1");
-      Address_Receive.Port := 5490;
+            declare
+               S : constant String := PolyORB_HI.Utils.To_String
+                                          (Name_Table (J).Location);
+               Channel  : Unsigned_8;
+               Datarate : Unsigned_8;
+               Address  : Address_T;
 
-      Create_Socket (Socket_Receive);
-      Set_Socket_Option
-           (Socket_Receive,
-            Socket_Level,
-            (Reuse_Address, True));
+               First, Last, i : Integer;
 
-      --  Since we always send small bursts of data and we do not
-      --  get reponse (all communications are asynchronous), we
-      --  disable the TCP "Nagle" algorithm and send ACK packets
-      --  immediately.
+            begin
+               First := S'First;
 
-      Set_Socket_Option
-           (Socket_Receive,
-            IP_Protocol_For_TCP_Level,
-            (No_Delay, True));
+               --  First parse the prefix "bluetooth"
 
-      Bind_Socket (Socket_Receive, Address_Receive);
-      Listen_Socket (Socket_Receive);
+               Last := Parse_String (S, First, ' ');
 
-      --  pragma Debug (Verbose,
-      --                Put_Line
-      --                  ("Local socket created for "
-      --                     & Image (Nodes (My_Node).Address)));
+               if S (First .. Last) /= "bluetooth" then
+                  raise Program_Error with "Invalid configuration";
+               end if;
+               
+               --  Then, parse the channel
 
-      --  Create the client to send CRTP packets
-      Address_Send.Addr := Inet_Addr("127.0.0.1");
-      Address_Send.Port := 5489;
+               First := Last + 2;
+               Last := Parse_String (S, First, ' ');
 
-      loop
-         Create_Socket (Socket_Send);
+               begin
+                  Channel := Unsigned_8'Value (S (First .. Last));
+               exception
+                  when others =>
+                     raise Program_Error with "Wrong channel" & S (First .. Last);
+               end;
+               if Channel > 125 then
+                  raise Program_Error with "Wrong channel" & S (First .. Last);
+               end if;
 
-         Next_Time := Clock + Milliseconds (200);
-         begin
-            --  pragma Debug (Verbose,
-            --                Put_Line
-            --                  ("Try to connect to "
-            --                     & Image (Nodes (N).Address)));
+               --  Then, parse the data rate
 
-            delay until Next_Time;
+               First := Last + 2;
+               Last := Parse_String (S, First, ' ');
+               
+               if S (First .. Last) = "250K" then
+                  Datarate :=  0;
+               elsif S (First .. Last) = "1M" then
+                  Datarate :=  1;
+               elsif S (First .. Last) = "2M" then
+                  Datarate :=  2;    
+               else
+                  raise Program_Error with "Wrong data rate: " & S (First .. Last);
+               end if;
 
-            Connect_Socket (Socket_Send, Address_Send);
-            exit;
-         exception
-            when Socket_Error =>
-               Close_Socket (Socket_Send);
-         end;
+               --  Finally, parse the address
+
+               First := Last + 2;
+               Last := Parse_String (S, First, ' ');
+
+               --  The address should be 5 bytes in hexadecimal
+               if Last - First /= 9 then
+                  raise Program_Error with "Wrong address: " & S (First .. Last);
+               end if;
+               
+               i := First;
+               while i < Last loop
+                  Address.Data (i) := Unsigned_8'Value (S (i .. i + 2));
+                  i := i + 2; 
+               end loop;    
+
+               Nodes (J).Bluetooth_Config.channel  := Bluetooth_Conf_T_channel (Channel);
+               Nodes (J).Bluetooth_Config.datarate := Datarate_T'Val (Datarate);
+               Nodes (J).Bluetooth_Config.address  := Address;
+               
+            end;
+         else
+            --  We got an ASN.1 configuration variable, use it
+            --  directly.
+            --  Use_ASN1 := True;
+            Nodes (J).Bluetooth_Config := To_Bluetooth_Conf_T_Acc
+              (Name_Table (J).Variable).all;
+
+         end if;
+      end loop;
+      
+      --  If the node is different from this one, construct its URI, 
+      --  add it to the list, and give the Node a corresponding Cf_ID  
+      for N in Node_Type'Range loop
+         if N /= My_Node then
+            URIs (Idx) := Get_URI_From_Bluetooth_Conf (Nodes (N).Bluetooth_Config);
+            Nodes (N).Cf_ID := Idx - 1; 
+            Idx := Idx + 1;
+         end if;
       end loop;
 
-      --  pragma Debug (Verbose,
-      --                Put_Line
-      --                  ("Connected to " & Image (Nodes (N).Address)));
+      --  Initialize Python Crazyflie Library, 
+      --  Initialize Crazyflies from the list of URIs
+      --  and try to connect to them
+      Calls.Call_Cflib_Init (URIs);
 
-      Initialize_Receiver;
-      --  pragma Debug (Verbose, Put_Line ("Initialization of socket subsystem"
-      --                          & " is complete"));
-      --  pragma Debug (Verbose, Put_Line ("Driver initialized"));
+      for N in Node_Type'Range loop
+         if N /= My_Node then
+            Nodes (N).State := CONNECTED;
+         end if;
+      end loop;
+
    exception
       when E : others =>
-         --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
-         --                  ("Exception "
-         --                     & Ada.Exceptions.Exception_Name (E)));
-         --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
-         --                  ("Message "
-         --                     & Ada.Exceptions.Exception_Message (E)));
-      null;
+         System.IO.Put_Line ("Exception "
+                             & Ada.Exceptions.Exception_Name (E));
+         System.IO.Put_Line ("Message  "
+                             & Ada.Exceptions.Exception_Message (E));
+
    end Initialize;
-
-   -------------------------
-   -- Initialize_Receiver --
-   -------------------------
-
-   procedure Initialize_Receiver is
-      Socket    : Socket_Type;
-      Address   : Sock_Addr_Type;
-
-      --  Channel : Stream_Access := Stream (Socket_Send);
-   begin
-      --  Wait for the connection of python socket
-
-      --  pragma Debug (Verbose, Put_Line
-      --                   ("Waiting on "
-      --                    & Image (Nodes (My_Node).Address)));
-
-      Accept_Socket (Socket_Receive, Socket, Address);
-      Socket_Receive := Socket;
-      --  String'Write (Channel, "Client accepted");
-
-   end Initialize_Receiver;
+   
 
    -------------
    -- Receive --
@@ -203,77 +259,60 @@ package body PolyORB_HI_Drivers_Client_BLE is
    procedure Receive is
       use type AS.Stream_Element_Offset;
 
-      SEL       : AS_Message_Length_Stream;
-      SEA       : AS_Full_Stream;
-      SEO       : AS.Stream_Element_Offset;
-
+      --  SEL : AS_Message_Length_Stream;
+      SEA : AS_Full_Stream;
+      SEO : AS.Stream_Element_Offset;
    begin
 
       Main_Loop :
       loop
-         --  Receive message length
+         for N in Node_Type'Range loop
+            if N /= My_Node and Nodes (N).State = CONNECTED then
+               --  Receive message from Crazyflie Cf_ID
+               Calls.Call_Receive_Packet_Data (Nodes (N).Cf_ID, SEA, SEO);
+  
+               --  The packet contains a PolyORB message
+               if SEO > SEA'First then
+                  --  Deliver to the peer handler
+                  --  pragma Debug (Verbose, Put_Line ("Delivering message"));
+                  System.IO.Put_Line ("Delivering message");
+                  PolyORB_HI_Generated.Transport.Deliver
+                          (Corresponding_Entity
+                             (Unsigned_8 (SEA (Message_Length_Size + 1))),
+                           To_PO_HI_Full_Stream (SEA)
+                           (1 .. Stream_Element_Offset (SEO)));
+                  
+               --  The connection with this Crazyflie has been lost
+               elsif SEO = SEA'First - 1 then
+                   System.IO.Put_Line ("Connection lost with Crazyflie " & Integer'Image (Nodes (N).Cf_ID));
+                   Nodes (N).State := DISCONNECTED;
+                   Dead_Links := Dead_Links + 1;
+                   if Dead_Links = NB_DRONES then
+                      System.IO.Put_Line ("All connections lost, destroy Cflib");
+                      Calls.Call_Cflib_Destroy;
+                      exit Main_Loop;
+                   end if;
 
-         Receive_Socket (Socket_Receive, SEL, SEO);
+               --  Connection alive but no PolyORB message
+               else
+                   null;
+               end if;
+               
+            end if;
+         end loop;
 
-         --  Receive zero bytes means that peer is dead
-         if SEO = 0 then
-            --  pragma Debug (Verbose, Put_Line ("Closing Socket_Receive"));
-            System.IO.Put_Line ("Closing socket"); 
-            Close_Socket (Socket_Receive);
-            exit Main_Loop;
-            
-         elsif SEO = SEL'First - 1 then
-            System.IO.Put_Line ("Dropped message");
-            goto End_Of_Loop;
-         end if;
-
-         SEO := AS.Stream_Element_Offset
-                 (To_Length (To_PO_HI_Message_Length_Stream (SEL)));
-         --  pragma Debug (Verbose, Put_Line
-         --                ("received"
-         --                   & AS.Stream_Element_Offset'Image (SEO)
-         --                   & " bytes"));
-
-         --  Get the message and preserve message length to keep
-         --  compatible with a local message delivery.
-
-         SEA (1 .. Message_Length_Size) := SEL;
-         Receive_Socket (Socket_Receive,
-                         SEA (Message_Length_Size + 1 .. SEO + 1),
-                         SEO);
-
-         if SEO = Message_Length_Size then
-            System.IO.Put_Line ("Dropped message");
-            goto End_Of_Loop;
-         end if;
-         
-         --  Deliver to the peer handler
-         --  pragma Debug (Verbose, Put_Line ("Delivering message"));
-         System.IO.Put_Line ("Delivering message");
-         PolyORB_HI_Generated.Transport.Deliver
-                 (Corresponding_Entity
-                    (Unsigned_8 (SEA (Message_Length_Size + 1))),
-                  To_PO_HI_Full_Stream (SEA)
-                  (1 .. Stream_Element_Offset (SEO)));
-
-         --  pragma Debug (Verbose, Put_Line ("Delivered"));
-         <<End_Of_Loop>>
       end loop Main_Loop;
 
    exception
       when E : others =>
-         --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
-         --                ("Exception "
-         --                 & Ada.Exceptions.Exception_Name (E)));
-         --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
-         --                ("Message "
-         --                 & Ada.Exceptions.Exception_Message (E)));
-      System.IO.Put_Line ("Exception "
-                          & Ada.Exceptions.Exception_Name (E));
-      System.IO.Put_Line ("Message  "
-                          & Ada.Exceptions.Exception_Message (E));
+         System.IO.Put_Line ("Exception "
+                             & Ada.Exceptions.Exception_Name (E));
+         System.IO.Put_Line ("Message  "
+                             & Ada.Exceptions.Exception_Message (E));
+         Calls.Call_Cflib_Destroy;
    end Receive;
 
+   
    ----------
    -- Send --
    ----------
@@ -284,17 +323,18 @@ package body PolyORB_HI_Drivers_Client_BLE is
       Size    : Stream_Element_Offset)
      return Error_Kind
    is
-      L : AS.Stream_Element_Offset;
-      pragma Unreferenced (L);
+      AS_Size : AS.Stream_Element_Offset := AS.Stream_Element_Offset (Size);
 
       --  Note: we cannot cast both array types using
       --  Ada.Unchecked_Conversion because they are unconstrained
       --  types. We cannot either use direct casting because component
       --  types are incompatible. The only time efficient manner to do
       --  the casting is to use representation clauses.
-      Msg : AS.Stream_Element_Array (1 .. AS.Stream_Element_Offset (Size));
+      Msg : AS.Stream_Element_Array (1 .. AS_Size);
       pragma Import (Ada, Msg);
       for Msg'Address use Message'Address;
+
+      Has_Succeed : Boolean;
 
    begin
 
@@ -304,17 +344,20 @@ package body PolyORB_HI_Drivers_Client_BLE is
          return Error_Kind'(Error_Transport);
       end if;
 
-      --  Put_Line ("Using user-provided TCP/IP stack to send");
-      Send_Socket (Socket_Send, Msg, L);
-      return Error_Kind'(Error_None);
+      Has_Succeed := Calls.Call_Send_Packet_Data (Nodes (Node).Cf_ID, Msg, AS_Size);
+      if Has_Succeed then
+         return Error_Kind'(Error_None);
+      else
+         System.IO.Put_Line ("Packet not sent");
+         return Error_Kind'(Error_Transport);
+      end if;
+      
    exception
       when E : others =>
-         --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
-         --                  ("Exception "
-         --                     & Ada.Exceptions.Exception_Name (E)));
-         --  pragma Debug (PolyORB_HI.Output.Error, Put_Line
-         --                  ("Message "
-         --                     & Ada.Exceptions.Exception_Message (E)));
+         System.IO.Put_Line ("Exception "
+                             & Ada.Exceptions.Exception_Name (E));
+         System.IO.Put_Line ("Message  "
+                             & Ada.Exceptions.Exception_Message (E));
       return Error_Kind'(Error_Transport);
    end Send;
 
