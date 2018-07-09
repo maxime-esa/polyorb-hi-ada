@@ -281,6 +281,7 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
       procedure CRTP_Get_T_Uint8_Data is new CRTP_Get_Data (T_Uint8);
 
       Rx_Packet : CRTP_Packet;
+      Rx_Handler : CRTP_Packet_Handler;
       Rx_Byte : T_Uint8;
       Has_Succeed : Boolean;
       SEA : AS_Full_Stream;
@@ -300,18 +301,19 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
 
          elsif Rx_Packet.Port = CRTP_PORT_CONSOLE
          then
-            --  Send_To_UART("[Receive] Packet received on CONSOLE port");
+            --  Send_To_UART("Packet received on CONSOLE port");
 
-            --  Extract PolyORB message
-            SEO := AS.Stream_Element_Offset (Rx_Packet.Data_2'Length);
+             --  Extract PolyORB message
+            Rx_Handler := CRTP_Get_Handler_From_Packet (Rx_Packet);
 
-            for i in Rx_Packet.Data_2'Range loop
-               CRTP_Get_T_Uint8_Data (CRTP_Get_Handler_From_Packet (Rx_Packet),
-                                      i, Rx_Byte, Has_Succeed);
+            for i in 1 .. Integer (Rx_Packet.Size) loop
+               CRTP_Get_T_Uint8_Data (Rx_Handler, i, Rx_Byte, Has_Succeed);     
                SEA (AS.Stream_Element_Offset (i)) := AS.Stream_Element (Rx_Byte);
             end loop;
 
-
+            SEO := AS.Stream_Element_Offset (Rx_Packet.Size);
+            
+            --  Send_To_UART("Delivering " & AS.Stream_Element_Offset'Image (SEO) & " bytes");
             --  Deliver to the peer handler
             begin
                PolyORB_HI_Generated.Transport.Deliver
@@ -321,11 +323,15 @@ package body PolyORB_HI_Drivers_Crazyflie_BLE is
                        (1 .. Stream_Element_Offset (SEO)));
             exception
                when E : others =>
-                  null; --  Put_Line (Ada.Exceptions.Exception_Information (E));
+                 Send_To_UART ("Exception : "
+                          & Ada.Exceptions.Exception_Name (E)
+                          & ", Message : "
+                          & Ada.Exceptions.Exception_Message (E));
             end;
 
          else
-            null;
+             --  null;
+             Send_To_UART ("Wrong Port received");
 
          end if;
 

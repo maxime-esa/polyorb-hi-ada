@@ -42,7 +42,6 @@ package PolyORB_HI_Drivers_Client_BLE is
    use PolyORB_HI.Streams;
 
    procedure Initialize (Name_Table : PolyORB_HI.Utils.Naming_Table_Type);
-   procedure Initialize_Receiver;
 
    procedure Receive;
 
