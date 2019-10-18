@@ -346,6 +346,14 @@ package body PolyORB_HI_Drivers_Native_UART is
                end if;
                Last_Index := Last_Index + 1;
             end loop;
+         exception
+            --  An exception can be raised on the first message, because it may
+            --  exceed the SEA size (Last_Index bigger than PDU_Size). This can
+            --  happen if the UART buffer on Linux was full - several messages may
+            --  have piled up. It's ok to discard the exception as a way to flush
+            --  the buffer, in the absence of any other synchronization mechanism.
+            when E : others =>
+                null;
          end;
 
          --  Deliver to the peer handler
